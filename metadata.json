@@ -1,0 +1,6 @@
+{
+  "name": "StudioFlow",
+  "description": "Sistema completo de agendamento e gestão financeira para profissionais da área da beleza, incluindo controle de agenda, serviços, clientes e caixa financeiro.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
