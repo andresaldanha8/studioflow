@@ -2295,7 +2295,7 @@ export default function App() {
       const url = editingSalonId ? `/api/admin/salons/${editingSalonId}` : "/api/admin/salons";
       const method = editingSalonId ? "PUT" : "POST";
 
-      const res = await fetch(url, {
+      const res = await fetch(apiUrl(url), {
         method,
         headers: getAuthHeaders("application/json"),
         body: JSON.stringify({
