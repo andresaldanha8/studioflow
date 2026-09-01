@@ -3,6 +3,7 @@ import path from "path";
 import { initMysql, getState, upsertState } from "./db/mysql";
 
 const DB_FILE = path.join(process.cwd(), "database.json");
+const USE_MYSQL = process.env.USE_MYSQL?.trim().toLowerCase() !== "false";
 
 function makeTmpName(base: string) {
   return `${base}.tmp.${process.pid}.${Date.now()}`;
@@ -17,6 +18,13 @@ let inMemoryDb: any = null;
 let mysqlInitialized = false;
 
 export async function initPersistence(): Promise<void> {
+  // Explicit local file mode: do not execute any MySQL operation.
+  if (!USE_MYSQL) {
+    mysqlInitialized = false;
+    inMemoryDb = null;
+    return;
+  }
+
   // Initialize MySQL and migrate seed if necessary
   const pool = await initMysql();
   mysqlInitialized = true;

@@ -78,6 +78,27 @@ export default function App() {
     }
   });
 
+  // Keep a ref to currentUser so listeners have latest value without reattaching
+  const currentUserRef = useRef<SessionUser | null>(currentUser);
+  const selectedSalonRef = useRef<Salon | null>(selectedSalon);
+  const localSessionInvalidatedRef = useRef(false);
+  const bookingsFetchInFlightRef = useRef(false);
+  const isMountedRef = useRef(false);
+  useEffect(() => {
+    currentUserRef.current = currentUser;
+  }, [currentUser]);
+
+  useEffect(() => {
+    selectedSalonRef.current = selectedSalon;
+  }, [selectedSalon]);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
   // Navigation within roles
   const [currentView, setCurrentView] = useState<string>("dashboard"); // default views
 
@@ -515,6 +536,8 @@ export default function App() {
     const oldRole = parsedUser ? parsedUser.role : null;
 
     setCurrentUser(user);
+    currentUserRef.current = user;
+    localSessionInvalidatedRef.current = false;
     if (user) {
       localStorage.setItem("user_session", JSON.stringify(user));
       // Route appropriately
@@ -578,6 +601,41 @@ export default function App() {
     }
   };
 
+  // Invalidate session only in this tab without touching persisted global session
+  const invalidateLocalSession = () => {
+    const prev = currentUserRef.current;
+    // Clear tab-local user
+    setCurrentUser(null);
+    currentUserRef.current = null;
+    localSessionInvalidatedRef.current = true;
+
+    // If previous was a professional, clear salon-specific UI state similar to full logout
+    if (prev && prev.role === "professional") {
+      setSelectedSalon(null);
+      setServices([]);
+      setBookings([]);
+      setBlocks([]);
+      setClients([]);
+      setCaixaEntries([]);
+      setFinanceStats({
+        dailyTotal: 0,
+        weeklyTotal: 0,
+        monthlyTotal: 0,
+        dailyHistory: []
+      });
+      setPortalMode("salon");
+      window.location.hash = "#pro";
+      setCurrentView("dashboard");
+    } else if (prev && prev.role === "client") {
+      setPortalMode("client");
+      setCurrentView("services");
+    } else if (prev && prev.role === "admin") {
+      setPortalMode("admin");
+      window.location.hash = "#admin";
+      setCurrentView("dashboard");
+    }
+  };
+
   const fetchSalons = async (customUser?: SessionUser | null) => {
     const userToVerify = customUser !== undefined ? customUser : currentUser;
     if (!userToVerify || userToVerify.role !== "admin") {
@@ -601,6 +659,55 @@ export default function App() {
     }
   };
 
+  // Sync user_session changes across tabs and ensure single-session invariant
+  // Consumer-only: do not write back to localStorage from this listener.
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      try {
+        if (e.key !== "user_session" && e.key !== "admin_session_backup") return;
+
+        if (e.key === "user_session") {
+          const newVal = e.newValue ? JSON.parse(e.newValue) : null;
+          const cur = currentUserRef.current;
+
+          // If the global session was cleared, invalidate only this tab
+          if (!newVal) {
+            if (cur) invalidateLocalSession();
+            return;
+          }
+
+          // If the global session changed to a different id/role, adopt it locally
+          if (!cur || cur.id !== newVal.id || cur.role !== newVal.role) {
+            // Apply persisted session to UI state only -- DO NOT write it back to localStorage
+            setCurrentUser(newVal);
+            currentUserRef.current = newVal;
+            localSessionInvalidatedRef.current = false;
+            // Adjust portalMode/view locally
+            if (newVal.role === "professional") {
+              setPortalMode("salon");
+              setCurrentView("dashboard");
+              if (newVal.salao) setSelectedSalon(newVal.salao);
+            } else if (newVal.role === "client") {
+              setPortalMode("client");
+              setCurrentView("services");
+            } else if (newVal.role === "admin") {
+              setPortalMode("admin");
+              setCurrentView("dashboard");
+            }
+          }
+        }
+
+        // Changes to admin_session_backup do not require direct action here;
+        // impersonation restore flow uses explicit handlers in the UI.
+      } catch (err) {
+        // swallow parsing errors
+      }
+    };
+
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
+
   const fetchSalonBySlug = async (slug: string) => {
     try {
       setLoading(true);
@@ -618,7 +725,7 @@ export default function App() {
             : currentUser.salao_id;
 
           if (userSalonId !== data.salon.id) {
-            handleSetUser(null);
+            invalidateLocalSession();
           }
         }
         
@@ -646,14 +753,37 @@ export default function App() {
     }
   };
 
+  const syncBookings = async (
+    salonId: string,
+    headers: Record<string, string>,
+    shouldApply: () => boolean = () => true
+  ) => {
+    if (bookingsFetchInFlightRef.current) return;
+
+    bookingsFetchInFlightRef.current = true;
+    try {
+      const response = await fetch(apiUrl(`/api/salons/${salonId}/bookings`), { headers });
+      if (!response.ok) return;
+
+      const data = await response.json();
+      if (!Array.isArray(data) || !isMountedRef.current || !shouldApply()) return;
+
+      setBookings(data);
+    } catch (err) {
+      console.error("Error syncing bookings", err);
+    } finally {
+      bookingsFetchInFlightRef.current = false;
+    }
+  };
+
   const loadSalonWorkspaceData = async (salonId: string, explicitToken?: string) => {
     try {
       // If explicitToken provided, use it and call all workspace endpoints (used for impersonation/explicit token flows)
       if (explicitToken) {
         const headers = { "Content-Type": "application/json", "Authorization": `Bearer ${explicitToken}` };
-        const [srvRes, bkgRes, blkRes, cxRes, fnRes, cliRes] = await Promise.all([
+        const [srvRes, , blkRes, cxRes, fnRes, cliRes] = await Promise.all([
           fetch(apiUrl(`/api/salons/${salonId}/services`), { headers }),
-          fetch(apiUrl(`/api/salons/${salonId}/bookings`), { headers }),
+          syncBookings(salonId, headers),
           fetch(apiUrl(`/api/salons/${salonId}/blocks`), { headers }),
           fetch(apiUrl(`/api/salons/${salonId}/caixa`), { headers }),
           fetch(apiUrl(`/api/salons/${salonId}/finance-reports`), { headers }),
@@ -661,7 +791,6 @@ export default function App() {
         ]);
 
         if (srvRes.ok) setServices(await srvRes.json());
-        if (bkgRes.ok) setBookings(await bkgRes.json());
         if (blkRes.ok) setBlocks(await blkRes.json());
         if (cxRes.ok) setCaixaEntries(await cxRes.json());
         if (fnRes.ok) setFinanceStats(await fnRes.json());
@@ -727,9 +856,9 @@ export default function App() {
 
       // Non-client (professional/admin) default behavior: use authenticated headers
       const headers = getAuthHeaders();
-      const [srvRes, bkgRes, blkRes, cxRes, fnRes, cliRes] = await Promise.all([
+      const [srvRes, , blkRes, cxRes, fnRes, cliRes] = await Promise.all([
         fetch(apiUrl(`/api/salons/${salonId}/services`), { headers }),
-        fetch(apiUrl(`/api/salons/${salonId}/bookings`), { headers }),
+        syncBookings(salonId, headers),
         fetch(apiUrl(`/api/salons/${salonId}/blocks`), { headers }),
         fetch(apiUrl(`/api/salons/${salonId}/caixa`), { headers }),
         fetch(apiUrl(`/api/salons/${salonId}/finance-reports`), { headers }),
@@ -737,7 +866,6 @@ export default function App() {
       ]);
 
       if (srvRes.ok) setServices(await srvRes.json());
-      if (bkgRes.ok) setBookings(await bkgRes.json());
       if (blkRes.ok) setBlocks(await blkRes.json());
       if (cxRes.ok) setCaixaEntries(await cxRes.json());
       if (fnRes.ok) setFinanceStats(await fnRes.json());
@@ -1853,60 +1981,155 @@ export default function App() {
   const getAuthHeaders = (contentType = "application/json") => {
     const saved = localStorage.getItem("user_session");
     const parsedUser = saved ? JSON.parse(saved) : null;
-    const user = parsedUser || currentUser;
+
+    // Prefer in-memory `currentUser` (tab-local) to avoid blindly using a
+    // token written by another tab. Fall back to persisted session only when
+    // there is no in-memory session for this tab.
+    const userToUse: SessionUser | null = currentUser || (!localSessionInvalidatedRef.current ? parsedUser : null);
     const headers: Record<string, string> = {};
-    if (contentType) {
-      headers["Content-Type"] = contentType;
-    }
-    if (user) {
-      // Only attach Authorization (and keep Content-Type if requested).
-      const token = (user as any).accessToken;
-      if (token) {
+    if (contentType) headers["Content-Type"] = contentType;
+
+    if (userToUse && (userToUse as any).accessToken) {
+      // If both persisted and in-memory sessions exist but disagree on id/role,
+      // prefer `currentUser` to avoid sending a token that does not belong to
+      // the visual identity of this tab.
+      const token = currentUser && parsedUser && (currentUser.id !== parsedUser.id || currentUser.role !== parsedUser.role)
+        ? currentUser.accessToken
+        : (userToUse as any).accessToken;
+      const payload = token ? decodeJwtPayload(token) : null;
+
+      // Never attach a token whose declared identity differs from the user
+      // represented by this tab/session.
+      if (token && payload && payload.role === userToUse.role && payload.sub === userToUse.id) {
         headers["Authorization"] = `Bearer ${token}`;
       }
     }
     return headers;
   };
 
-    // Single-flight refresh control and global fetch wrapper
-    const refreshPromiseRef = useRef<Promise<boolean> | null>(null);
-    const originalFetchRef = useRef<typeof fetch | null>(null);
+  const refetchProfessionalBookings = () => {
+    const activeUser = currentUserRef.current;
+    const activeSalon = selectedSalonRef.current;
+    if (!activeUser || activeUser.role !== "professional" || !activeSalon) return;
 
-    const doRefresh = async (): Promise<boolean> => {
-      // If currently impersonating, do not attempt cookie-based refresh
-      const saved = localStorage.getItem('user_session');
-      const parsedSaved = saved ? JSON.parse(saved) : null;
-      const activeUser = currentUser || parsedSaved;
-      if (activeUser && (activeUser as any).isImpersonated) {
-        return false;
-      }
+    const expectedUserId = activeUser.id;
+    const expectedSalonId = activeSalon.id;
+    void syncBookings(expectedSalonId, getAuthHeaders(), () => {
+      const latestUser = currentUserRef.current;
+      const latestSalon = selectedSalonRef.current;
+      return (
+        latestUser?.role === "professional" &&
+        latestUser.id === expectedUserId &&
+        latestSalon?.id === expectedSalonId
+      );
+    });
+  };
 
-      if (refreshPromiseRef.current) return refreshPromiseRef.current;
-      refreshPromiseRef.current = (async () => {
-        try {
-          const res = await (originalFetchRef.current || fetch)(apiUrl('/auth/refresh'), { method: 'POST', credentials: 'include' });
-          if (!res.ok) return false;
-          const js = await res.json();
-          if (js && js.accessToken) {
-            const saved = localStorage.getItem('user_session');
-            const parsed = saved ? JSON.parse(saved) : null;
-            if (parsed) {
-              parsed.accessToken = js.accessToken;
-              // Persist updated session and update state
-              localStorage.setItem('user_session', JSON.stringify(parsed));
-              handleSetUser(parsed);
-            }
-            return true;
-          }
-          return false;
-        } catch (e) {
-          return false;
-        } finally {
-          refreshPromiseRef.current = null;
-        }
-      })();
-      return refreshPromiseRef.current;
+  useEffect(() => {
+    if (currentView !== "agenda" || currentUser?.role !== "professional" || !selectedSalon) return;
+    refetchProfessionalBookings();
+  }, [currentView, currentUser?.id, currentUser?.role, selectedSalon?.id]);
+
+  useEffect(() => {
+    if (currentUser?.role !== "professional" || !selectedSalon) return;
+
+    const intervalId = window.setInterval(() => {
+      if (!document.hidden) refetchProfessionalBookings();
+    }, 30_000);
+
+    const handleVisibilityChange = () => {
+      if (!document.hidden) refetchProfessionalBookings();
     };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      window.clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [currentUser?.id, currentUser?.role, selectedSalon?.id]);
+
+  // Single-flight refresh control and global fetch wrapper
+  const refreshPromiseRef = useRef<Promise<boolean> | null>(null);
+  const originalFetchRef = useRef<typeof fetch | null>(null);
+
+  const decodeJwtPayload = (token: string): any | null => {
+    try {
+      const parts = token.split(".");
+      if (parts.length < 2) return null;
+      // base64url -> base64
+      const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+      const json = decodeURIComponent((window.atob(b64).split("").map((c) => `%${("00" + c.charCodeAt(0).toString(16)).slice(-2)}`).join("")));
+      return JSON.parse(json);
+    } catch (e) {
+      return null;
+    }
+  };
+
+  const doRefresh = async (): Promise<boolean> => {
+    // If currently impersonating, do not attempt cookie-based refresh
+    const saved = localStorage.getItem('user_session');
+    const parsedSaved = saved ? JSON.parse(saved) : null;
+    const activeUser = currentUserRef.current || (!localSessionInvalidatedRef.current ? parsedSaved : null);
+    if (!activeUser) return false;
+    if (activeUser && (activeUser as any).isImpersonated) {
+      return false;
+    }
+
+    const expectedRole = activeUser ? activeUser.role : undefined;
+    const expectedSub = activeUser ? activeUser.id : undefined;
+
+    if (refreshPromiseRef.current) return refreshPromiseRef.current;
+    refreshPromiseRef.current = (async () => {
+      try {
+        const res = await (originalFetchRef.current || fetch)(apiUrl('/auth/refresh'), { method: 'POST', credentials: 'include' });
+        if (!res.ok) return false;
+        const js = await res.json();
+        if (js && js.accessToken) {
+          // Validate decoded payload to ensure the returned token belongs to
+          // the expected session (role + sub). Do NOT validate signature here.
+          const payload = decodeJwtPayload(js.accessToken);
+          if (!payload) return false;
+
+          if (expectedRole && payload.role !== expectedRole) {
+            // Token mismatch: do not overwrite persisted session. Invalidate
+            // current tab session only to enforce single-session invariant.
+            invalidateLocalSession();
+            return false;
+          }
+          if (expectedSub && payload.sub !== expectedSub) {
+            invalidateLocalSession();
+            return false;
+          }
+
+          const savedNow = localStorage.getItem('user_session');
+          const parsed = savedNow ? JSON.parse(savedNow) : null;
+          if (parsed) {
+            // The global session may have changed while refresh was in flight.
+            // Never write this tab's refreshed token into another identity.
+            if (parsed.role !== expectedRole || parsed.id !== expectedSub) {
+              invalidateLocalSession();
+              return false;
+            }
+            parsed.accessToken = js.accessToken;
+            // Persist updated session and update state
+            localStorage.setItem('user_session', JSON.stringify(parsed));
+            handleSetUser(parsed);
+          } else {
+            // The global session was removed while refresh was in flight.
+            invalidateLocalSession();
+            return false;
+          }
+          return true;
+        }
+        return false;
+      } catch (e) {
+        return false;
+      } finally {
+        refreshPromiseRef.current = null;
+      }
+    })();
+    return refreshPromiseRef.current;
+  };
 
     useEffect(() => {
       // wrap window.fetch to handle 401 -> refresh -> retry (single-flight)
@@ -1928,8 +2151,9 @@ export default function App() {
 
         const refreshed = await doRefresh();
         if (!refreshed) {
-          // Logout user on refresh failure
-          handleSetUser(null);
+          // Automatic refresh failure invalidates only this tab. It must not
+          // remove a newer global session created by another tab.
+          invalidateLocalSession();
           return resp;
         }
 
